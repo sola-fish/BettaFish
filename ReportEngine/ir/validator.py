@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from .schema import ALLOWED_BLOCK_TYPES, ALLOWED_INLINE_MARKS, IR_VERSION
+from .schema import (
+    ALLOWED_BLOCK_TYPES,
+    ALLOWED_INLINE_MARKS,
+    ENGINE_AGENT_TITLES,
+    IR_VERSION,
+)
 
 
 class IRValidator:
@@ -127,6 +132,69 @@ class IRValidator:
                         errors,
                     )
 
+    def _validate_swotTable_block(self, block: Dict[str, Any], path: str, errors: List[str]):
+        """SWOT表至少提供四象限之一，每象限为条目数组"""
+        quadrants = ("strengths", "weaknesses", "opportunities", "threats")
+        if not any(block.get(name) is not None for name in quadrants):
+            errors.append(f"{path} 需要至少包含 strengths/weaknesses/opportunities/threats 之一")
+        for name in quadrants:
+            entries = block.get(name)
+            if entries is None:
+                continue
+            if not isinstance(entries, list):
+                errors.append(f"{path}.{name} 必须是数组")
+                continue
+            for idx, entry in enumerate(entries):
+                self._validate_swot_item(entry, f"{path}.{name}[{idx}]", errors)
+
+    # SWOT impact 字段允许的评级值
+    ALLOWED_IMPACT_VALUES = {"低", "中低", "中", "中高", "高", "极高"}
+
+    def _validate_swot_item(self, item: Any, path: str, errors: List[str]):
+        """单个SWOT条目支持字符串或带字段的对象"""
+        if isinstance(item, str):
+            if not item.strip():
+                errors.append(f"{path} 不能为空字符串")
+            return
+        if not isinstance(item, dict):
+            errors.append(f"{path} 必须是字符串或对象")
+            return
+        title = None
+        for key in ("title", "label", "text", "detail", "description"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                title = value
+                break
+        if title is None:
+            errors.append(f"{path} 缺少 title/label/text/description 等文字字段")
+
+        # 校验 impact 字段：只允许评级值
+        impact = item.get("impact")
+        if impact is not None:
+            if not isinstance(impact, str) or impact not in self.ALLOWED_IMPACT_VALUES:
+                errors.append(
+                    f"{path}.impact 只允许填写影响评级（低/中低/中/中高/高/极高），"
+                    f"当前值: {impact}；如需详细说明请写入 detail 字段"
+                )
+
+        # # 校验 score 字段：只允许 0-10 的数字（已禁用）
+        # score = item.get("score")
+        # if score is not None:
+        #     valid_score = False
+        #     if isinstance(score, (int, float)):
+        #         valid_score = 0 <= score <= 10
+        #     elif isinstance(score, str):
+        #         # 兼容字符串形式的数字
+        #         try:
+        #             numeric_score = float(score)
+        #             valid_score = 0 <= numeric_score <= 10
+        #         except ValueError:
+        #             valid_score = False
+        #     if not valid_score:
+        #         errors.append(
+        #             f"{path}.score 只允许填写 0-10 的数字，当前值: {score}"
+        #         )
+
     def _validate_blockquote_block(
         self, block: Dict[str, Any], path: str, errors: List[str]
     ):
@@ -137,6 +205,56 @@ class IRValidator:
             return
         for idx, sub_block in enumerate(inner):
             self._validate_block(sub_block, f"{path}.blocks[{idx}]", errors)
+
+    def _validate_engineQuote_block(
+        self, block: Dict[str, Any], path: str, errors: List[str]
+    ):
+        """单引擎发言块需标注engine并包含子blocks"""
+        engine_raw = block.get("engine")
+        engine = engine_raw.lower() if isinstance(engine_raw, str) else None
+        if engine not in {"insight", "media", "query"}:
+            errors.append(f"{path}.engine 取值非法: {engine_raw}")
+        title = block.get("title")
+        expected_title = ENGINE_AGENT_TITLES.get(engine) if engine else None
+        if title is None:
+            errors.append(f"{path}.title 缺失")
+        elif not isinstance(title, str):
+            errors.append(f"{path}.title 必须是字符串")
+        elif expected_title and title != expected_title:
+            errors.append(
+                f"{path}.title 必须与engine一致，使用对应Agent名称: {expected_title}"
+            )
+        inner = block.get("blocks")
+        if not isinstance(inner, list) or not inner:
+            errors.append(f"{path}.blocks 必须是非空数组")
+            return
+        for idx, sub_block in enumerate(inner):
+            sub_path = f"{path}.blocks[{idx}]"
+            if not isinstance(sub_block, dict):
+                errors.append(f"{sub_path} 必须是对象")
+                continue
+            if sub_block.get("type") != "paragraph":
+                errors.append(f"{sub_path}.type 仅允许 paragraph")
+                continue
+            # 复用 paragraph 结构校验，但限制 marks
+            inlines = sub_block.get("inlines")
+            if not isinstance(inlines, list) or not inlines:
+                errors.append(f"{sub_path}.inlines 必须是非空数组")
+                continue
+            for ridx, run in enumerate(inlines):
+                self._validate_inline_run(run, f"{sub_path}.inlines[{ridx}]", errors)
+                if not isinstance(run, dict):
+                    continue
+                marks = run.get("marks") or []
+                if not isinstance(marks, list):
+                    errors.append(f"{sub_path}.inlines[{ridx}].marks 必须是数组")
+                    continue
+                for midx, mark in enumerate(marks):
+                    mark_type = mark.get("type") if isinstance(mark, dict) else None
+                    if mark_type not in {"bold", "italic"}:
+                        errors.append(
+                            f"{sub_path}.inlines[{ridx}].marks[{midx}].type 仅允许 bold/italic"
+                        )
 
     def _validate_callout_block(self, block: Dict[str, Any], path: str, errors: List[str]):
         """callout需声明tone，并至少有一个子block"""
